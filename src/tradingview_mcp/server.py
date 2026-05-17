@@ -17,6 +17,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from mcp.server.transport_security import TransportSecuritySettings
 
 # ── Service imports ────────────────────────────────────────────────────────────
 from tradingview_mcp.core.services.coinlist import load_symbols
@@ -1089,6 +1090,11 @@ def _offload_sync_tools() -> int:
 
 _OFFLOADED_TOOL_COUNT = _offload_sync_tools()
 
+def _split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="TradingView Screener MCP server")
@@ -1101,6 +1107,16 @@ def main() -> None:
     )
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    parser.add_argument(
+        "--allowed-hosts",
+        default=os.environ.get("MCP_ALLOWED_HOSTS", ""),
+        help="Comma-separated Host headers allowed by MCP DNS rebinding protection",
+    )
+    parser.add_argument(
+        "--allowed-origins",
+        default=os.environ.get("MCP_ALLOWED_ORIGINS", ""),
+        help="Comma-separated Origin headers allowed by MCP DNS rebinding protection",
+    )
     args = parser.parse_args()
 
     if os.environ.get("DEBUG_MCP"):
@@ -1113,6 +1129,14 @@ def main() -> None:
         try:
             mcp.settings.host = args.host
             mcp.settings.port = args.port
+            allowed_hosts = _split_csv(args.allowed_hosts)
+            allowed_origins = _split_csv(args.allowed_origins)
+            if allowed_hosts or allowed_origins:
+                mcp.settings.transport_security = TransportSecuritySettings(
+                    enable_dns_rebinding_protection=True,
+                    allowed_hosts=allowed_hosts,
+                    allowed_origins=allowed_origins,
+                )
         except Exception:
             pass
         mcp.run(transport="streamable-http")

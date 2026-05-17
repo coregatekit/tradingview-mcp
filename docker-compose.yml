@@ -12,3 +12,5 @@ services:
       # Optional: Add any future API keys or environment variables here
       - PORT=8000
       - HOST=0.0.0.0
+      # Comma-separated Host headers accepted by MCP DNS rebinding protection
+      - MCP_ALLOWED_HOSTS=localhost:*,127.0.0.1:*
