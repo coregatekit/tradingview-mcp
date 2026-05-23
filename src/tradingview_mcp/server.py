@@ -1117,6 +1117,12 @@ def main() -> None:
         default=os.environ.get("MCP_ALLOWED_ORIGINS", ""),
         help="Comma-separated Origin headers allowed by MCP DNS rebinding protection",
     )
+    parser.add_argument(
+        "--no-dns-rebinding-protection",
+        action="store_true",
+        default=os.environ.get("MCP_ENABLE_DNS_REBINDING_PROTECTION", "true").lower() == "false",
+        help="Disable MCP DNS rebinding protection",
+    )
     args = parser.parse_args()
 
     if os.environ.get("DEBUG_MCP"):
@@ -1131,12 +1137,16 @@ def main() -> None:
             mcp.settings.port = args.port
             allowed_hosts = _split_csv(args.allowed_hosts)
             allowed_origins = _split_csv(args.allowed_origins)
-            if allowed_hosts or allowed_origins:
-                mcp.settings.transport_security = TransportSecuritySettings(
-                    enable_dns_rebinding_protection=True,
-                    allowed_hosts=allowed_hosts,
-                    allowed_origins=allowed_origins,
-                )
+            
+            enable_protection = not args.no_dns_rebinding_protection
+            if allowed_hosts == ["*"]:
+                enable_protection = False
+                
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=enable_protection,
+                allowed_hosts=allowed_hosts,
+                allowed_origins=allowed_origins,
+            )
         except Exception:
             pass
         mcp.run(transport="streamable-http")
