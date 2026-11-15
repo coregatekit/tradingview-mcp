@@ -1,12 +1,15 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 from ..utils.validators import get_market_type
+from .indicators import AVERAGE_VOLUME, RELATIVE_VOLUME
 import json as _json
 import os as _os
 import random as _random
 import socket as _socket
 import sys as _sys
 import time as _time
+from contextlib import contextmanager as _contextmanager
+from contextvars import ContextVar as _ContextVar
 from threading import RLock as _RLock, Semaphore as _Semaphore, Lock as _Lock
 
 
@@ -53,6 +56,35 @@ def _ensure_socket_timeout() -> None:
 _ensure_socket_timeout()
 
 
+# --- One indicators dict per tradingview_ta Analysis (added 2026-10-27) ----
+# tradingview_ta.main.Analysis declares `indicators = {}` on the class, and
+# calculate() fills it with `analysis.indicators[key] = value` before copying
+# it onto the instance. Those writes land in the one dict every Analysis
+# shares, so a column one request asks for and the next doesn't stays behind:
+# multi_timeframe_analysis is the only request that includes ATR, and from
+# then on coin_analysis reported that symbol's ATR for every other symbol (BTC
+# 4h read 0.0003, DOGE's) and skipped its own ATR lookup. Threads computing at
+# the same moment could also swap values. With an instance dict per Analysis,
+# calculate() fills that one instead.
+def _give_each_analysis_its_own_indicators() -> None:
+    try:
+        from tradingview_ta.main import Analysis  # type: ignore
+    except Exception:
+        return  # not installed: the callers already report that
+    # Only the class-attribute version has the problem. A release that sets up
+    # its own instance state in __init__ is left alone.
+    if Analysis.__init__ is not object.__init__:
+        return
+
+    def __init__(self) -> None:
+        self.indicators = {}
+
+    Analysis.__init__ = __init__
+
+
+_give_each_analysis_its_own_indicators()
+
+
 # --- Resilience layer (added 2026-05-13, hardened 2026-05-20) --------------
 # TradingView's scanner.tradingview.com endpoint occasionally returns an empty
 # body on transient hiccups, causing tradingview-screener to raise
@@ -85,6 +117,7 @@ _ensure_socket_timeout()
 #   TRADINGVIEW_MCP_RETRY_DELAYS default "1.0,4.0"
 #   TRADINGVIEW_MCP_RETRY_JITTER default 0.2  (±20% jitter on each delay)
 #   TRADINGVIEW_MCP_FAILURE_COOLDOWN_S default 15 (seconds)
+#   TRADINGVIEW_MCP_TA_DEADLINE_S default 8 (seconds; budget of one ta_call())
 
 def _cache_ttl_s() -> float:
     try:
@@ -127,13 +160,23 @@ def _jittered(delay: float) -> float:
     return max(0.0, delay * (1.0 + _random.uniform(-j, j)))
 
 
-# --- Shared failure cooldown (added 2026-05-19) ---------------------------
+# --- Failure cooldown (added 2026-05-19, one per request path 2026-11-14) --
 # When a call exhausts all retries (sustained upstream outage), the next
 # call shouldn't immediately re-hammer with another full retry round —
-# that just compounds load on a struggling upstream. After a full-retry
-# failure, subsequent calls wait up to TRADINGVIEW_MCP_FAILURE_COOLDOWN_S
-# seconds before starting their own retry sequence, giving upstream room
-# to recover. The cooldown decays as time passes since last failure.
+# that just compounds load on a struggling upstream.
+#
+# The two request paths fail independently. TradingView answers
+# tradingview_ta's requests with empty bodies in bursts of minutes while the
+# scanner requests tradingview-screener makes keep working: on the hosted
+# server, in the week to 2026-11-14, 171 TA fetches failed and no scanner
+# request did. So each path keeps its own last-failure time, and a TA refusal
+# no longer makes multi_timeframe_analysis or the scans sleep.
+#
+# - Scanner path (_scan_with_retry): after a full-retry failure, subsequent
+#   calls wait up to TRADINGVIEW_MCP_FAILURE_COOLDOWN_S seconds before
+#   starting their own retry sequence. The wait decays with time.
+# - TA path (resilient_get_multiple_analysis): within the same window it
+#   doesn't wait or retry at all; see there.
 def _failure_cooldown_s() -> float:
     # Tightened 2026-05-20: 15s is enough to absorb a brief upstream blip
     # without compounding wait time across multiple skill calls.
@@ -143,7 +186,8 @@ def _failure_cooldown_s() -> float:
         return 15.0
 
 
-_LAST_TA_FAILURE_TS: float = 0.0
+_LAST_TA_FAILURE_TS: float = 0.0    # tradingview_ta path
+_LAST_SCAN_FAILURE_TS: float = 0.0  # tradingview-screener path
 _TA_FAILURE_LOCK = _Lock()
 
 
@@ -153,14 +197,41 @@ def _record_ta_failure() -> None:
         _LAST_TA_FAILURE_TS = _time.time()
 
 
+def _clear_ta_failure() -> None:
+    global _LAST_TA_FAILURE_TS
+    with _TA_FAILURE_LOCK:
+        _LAST_TA_FAILURE_TS = 0.0
+
+
+def _record_scan_failure() -> None:
+    global _LAST_SCAN_FAILURE_TS
+    with _TA_FAILURE_LOCK:
+        _LAST_SCAN_FAILURE_TS = _time.time()
+
+
+def _ta_refusal_age_s() -> Optional[float]:
+    """Seconds since a TA fetch last exhausted its attempts, while that is
+    inside the cooldown window, else None. A success clears it."""
+    cooldown = _failure_cooldown_s()
+    if cooldown <= 0:
+        return None
+    with _TA_FAILURE_LOCK:
+        ts = _LAST_TA_FAILURE_TS
+    if ts == 0.0:
+        return None
+    age = _time.time() - ts
+    return age if age < cooldown else None
+
+
 def _wait_for_failure_cooldown() -> None:
-    """If a previous call recently exhausted all retries, sleep until the
-    cooldown elapses before starting a new retry sequence."""
+    """Scanner path: if a previous scanner call recently exhausted all
+    retries, sleep until the cooldown elapses before starting a new retry
+    sequence."""
     cooldown = _failure_cooldown_s()
     if cooldown <= 0:
         return
     with _TA_FAILURE_LOCK:
-        ts = _LAST_TA_FAILURE_TS
+        ts = _LAST_SCAN_FAILURE_TS
     if ts == 0.0:
         return
     elapsed = _time.time() - ts
@@ -178,6 +249,10 @@ def _wait_for_failure_cooldown() -> None:
 
 _SCREENER_CACHE: Dict[Tuple, Tuple[float, Any]] = {}
 _SCREENER_CACHE_LOCK = _RLock()
+# Entries were only ever popped on a stale *lookup*, so a long-running server
+# serving many distinct (symbols, interval) tuples grew without bound. Evict
+# oldest-first past this cap.
+_SCREENER_CACHE_MAX_ENTRIES = 256
 
 
 def _cache_get(key: Tuple):
@@ -224,6 +299,9 @@ def _cache_set(key: Tuple, payload: Any) -> None:
         return
     with _SCREENER_CACHE_LOCK:
         _SCREENER_CACHE[key] = (_time.time(), payload)
+        while len(_SCREENER_CACHE) > _SCREENER_CACHE_MAX_ENTRIES:
+            oldest = min(_SCREENER_CACHE, key=lambda k: _SCREENER_CACHE[k][0])
+            _SCREENER_CACHE.pop(oldest, None)
 
 
 # --- Throttle for tradingview_ta calls (added 2026-05-15) -----------------
@@ -281,6 +359,58 @@ def _ta_throttle_release() -> None:
     _TA_SEMAPHORE.release()
 
 
+# --- Per-call budget for the TA path (added 2026-11-14) --------------------
+# coin_analysis has to answer within a bounded time and say when its numbers
+# came from the stale cache. Both travel in a context variable instead of new
+# parameters, so every get_multiple_analysis caller (and test fake) keeps its
+# signature; only code that opens a ta_call() gets a budget.
+_MIN_ATTEMPT_S = 2.0  # never cut one request's timeout below this
+_TA_CALL: _ContextVar = _ContextVar("tradingview_mcp_ta_call", default=None)
+
+
+def _ta_deadline_s() -> float:
+    try:
+        return max(0.0, float(_os.environ.get('TRADINGVIEW_MCP_TA_DEADLINE_S', '8')))
+    except Exception:
+        return 8.0
+
+
+@_contextmanager
+def ta_call(deadline_s: Optional[float] = None):
+    """Give the TA fetches made inside this block one wall-clock budget, and
+    report how they were answered.
+
+    Yields a dict. ``stale_age_s`` is the age in seconds of the stale-cache
+    result a fetch fell back to, or None while the data is live.
+    ``deadline_at`` is when the budget runs out on the monotonic clock (None
+    with no budget); :func:`ta_call_time_left` turns it into a timeout.
+
+    Args:
+        deadline_s: Budget in seconds. Defaults to TRADINGVIEW_MCP_TA_DEADLINE_S
+            (8); 0 means no budget.
+    """
+    budget = _ta_deadline_s() if deadline_s is None else max(0.0, deadline_s)
+    state = {
+        "deadline_at": _time.monotonic() + budget if budget > 0 else None,
+        "stale_age_s": None,
+    }
+    token = _TA_CALL.set(state)
+    try:
+        yield state
+    finally:
+        _TA_CALL.reset(token)
+
+
+def ta_call_time_left(state: Optional[dict], cap: float) -> float:
+    """Timeout for one more request made under a :func:`ta_call` state:
+    ``cap``, cut to what is left of the budget, but not below a single
+    attempt's floor (a request that just queued gets its chance)."""
+    deadline_at = (state or {}).get("deadline_at")
+    if deadline_at is None:
+        return cap
+    return min(cap, max(_MIN_ATTEMPT_S, deadline_at - _time.monotonic()))
+
+
 def _is_transient_screener_error(e: BaseException) -> bool:
     """True if the error looks like an upstream transient (empty body,
     JSON parse failure, connection reset, rate limit, or socket timeout)."""
@@ -302,12 +432,21 @@ def _is_transient_screener_error(e: BaseException) -> bool:
     ))
 
 
-def _format_transient_error(last_exc: BaseException, attempts: int, total_wait: float) -> str:
-    """Build an actionable terminal error message for callers."""
+def _format_transient_error(
+    last_exc: BaseException, attempts: int, total_wait: float, why: str = ""
+) -> str:
+    """Build an actionable terminal error message for callers.
+
+    ``why`` explains a short attempt count (no retry while TradingView is
+    refusing, or no budget left for one)."""
     base = repr(last_exc)
+    tried = (
+        f"on all {attempts} attempts spanning {total_wait:.0f}s"
+        if attempts > 1 else "on its only attempt"
+    )
     return (
-        f"Upstream TradingView scanner returned transient errors on all "
-        f"{attempts} attempts spanning {total_wait:.0f}s ({base}). "
+        f"Upstream TradingView scanner returned transient errors {tried} ({base}). "
+        f"{why + ' ' if why else ''}"
         f"This is typically a 30-90s empty-body outage at scanner.tradingview.com. "
         f"Wait ~60s before retrying."
     )
@@ -330,13 +469,24 @@ def humanize_upstream_error(exc: BaseException) -> str:
     return msg
 
 
-def _scan_with_retry(q, cookies=None, cache_key: Optional[Tuple] = None):
+def _scan_with_retry(
+    q,
+    cookies=None,
+    cache_key: Optional[Tuple] = None,
+    raw: bool = False,
+    throttle: bool = False,
+):
     """Wrap Query.get_scanner_data with retries on transient TV outages.
-    Returns (total, df). Re-raises on non-transient errors or on final failure.
+    Returns (total, df), or the scanner's JSON dict when ``raw`` is True.
+    Re-raises on non-transient errors or on final failure.
 
     If ``cache_key`` is provided and all retries fail, attempts to return a
     stale-but-usable cached payload before raising — callers that pass a key
-    get stale-while-error behavior automatically."""
+    get stale-while-error behavior automatically.
+
+    ``throttle`` holds a tradingview_ta throttle slot for each attempt (not
+    across the backoff sleeps), so heavy whole-exchange scans share the same
+    in-flight cap and start spacing as the per-symbol TA calls."""
     _wait_for_failure_cooldown()
     delays = (0.0,) + _retry_delays()  # immediate try, then back off
     last_exc: Optional[BaseException] = None
@@ -347,7 +497,22 @@ def _scan_with_retry(q, cookies=None, cache_key: Optional[Tuple] = None):
             _time.sleep(wait)
             total_wait += wait
         try:
-            return q.get_scanner_data(cookies=cookies)
+            if throttle:
+                _ta_throttle_acquire()
+            try:
+                if raw:
+                    result = q.get_scanner_data_raw(cookies=cookies)
+                else:
+                    result = q.get_scanner_data(cookies=cookies)
+            finally:
+                if throttle:
+                    _ta_throttle_release()
+            # Populate the cache on success — without this, the advertised
+            # stale-while-error fallback below could NEVER fire for callers
+            # passing cache_key (nothing was ever stored under it).
+            if cache_key is not None:
+                _cache_set(cache_key, result)
+            return result
         except Exception as e:  # noqa: BLE001 - intentionally broad, narrowed below
             if not _is_transient_screener_error(e):
                 raise
@@ -362,7 +527,7 @@ def _scan_with_retry(q, cookies=None, cache_key: Optional[Tuple] = None):
                 pass
             continue
     # All attempts exhausted — record failure so subsequent calls back off
-    _record_ta_failure()
+    _record_scan_failure()
     # Last-resort: stale-while-error fallback if we have a cache key
     if cache_key is not None:
         stale = _cache_get_stale(cache_key)
@@ -381,36 +546,83 @@ def _scan_with_retry(q, cookies=None, cache_key: Optional[Tuple] = None):
     raise RuntimeError(_format_transient_error(last_exc, len(delays), total_wait)) from last_exc
 
 
+# Scanner columns the indicator helpers read that tradingview_ta doesn't
+# request: the volume baseline (TradingView has no volume-SMA column).
+# tradingview_ta adds the interval suffix to them, as to its own columns.
+TA_EXTRA_COLUMNS = (RELATIVE_VOLUME, AVERAGE_VOLUME)
+
+
 def resilient_get_multiple_analysis(screener, interval, symbols):
     """Drop-in replacement for tradingview_ta.get_multiple_analysis with the
     same resilience layer used by the screener calls (retry + cache + stale
     fallback). Required because coin_analysis / combined_analysis /
     multi_timeframe_analysis use tradingview_ta directly and hit the same
     transient JSON errors when TradingView's scanner endpoint returns an
-    empty body."""
+    empty body.
+
+    Every request also asks for ``TA_EXTRA_COLUMNS``, which land in each
+    ``Analysis.indicators`` under their bare names.
+
+    While TradingView is refusing TA requests (a fetch exhausted its attempts
+    less than TRADINGVIEW_MCP_FAILURE_COOLDOWN_S ago), this neither sleeps nor
+    retries: it answers from the stale cache at once, or makes one attempt
+    when there is nothing cached. Its refusals come in bursts of minutes; on
+    the hosted server not one call that waited out the cooldown and retried
+    got live data back (week to 2026-11-14), the waits just made coin_analysis
+    take ~20s and the retries tripled the requests inside each burst.
+
+    Inside a :func:`ta_call` block, each attempt's timeout is cut to the
+    budget left, no retry starts that the budget can't cover, and a stale
+    answer is reported in the block's state."""
     try:
         from tradingview_ta import get_multiple_analysis as _gma  # type: ignore
     except Exception as e:
         raise ImportError("tradingview_ta is not installed") from e
 
     sym_key = tuple(sorted(symbols)) if symbols else ()
-    cache_key = ('ta_multi_v1', screener, interval, sym_key)
+    cache_key = ('ta_multi_v2', screener, interval, sym_key)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    _wait_for_failure_cooldown()
-    delays = (0.0,) + _retry_delays()
+    call = _TA_CALL.get()
+    why_short = ""
+    refused_s_ago = _ta_refusal_age_s()
+    if refused_s_ago is not None:
+        stale = _cache_get_stale(cache_key)
+        if stale is not None:
+            return _stale_ta_result(
+                stale, symbols, call,
+                f"without a new attempt: TradingView refused a request {refused_s_ago:.0f}s ago",
+            )
+        delays: tuple = (0.0,)
+        why_short = (
+            f"TradingView refused this server's requests {refused_s_ago:.0f}s ago, "
+            f"so this call did not retry."
+        )
+    else:
+        delays = (0.0,) + _retry_delays()
     last_exc: Optional[BaseException] = None
     total_wait = 0.0
+    attempts = 0
     for i, delay in enumerate(delays):
         wait = _jittered(delay) if delay > 0 else 0.0
         if wait > 0:
+            if _ta_refusal_age_s() is not None:
+                # Another fetch has meanwhile used up its attempts: the refusal
+                # is on, and this retry would only add to it.
+                why_short = "TradingView refused another request meanwhile, so this call stopped retrying."
+                break
+            deadline_at = (call or {}).get("deadline_at")
+            if deadline_at is not None and deadline_at - _time.monotonic() < wait + _MIN_ATTEMPT_S:
+                why_short = "The call's time budget left no room for another attempt."
+                break
             _time.sleep(wait)
             total_wait += wait
         try:
             _ta_throttle_acquire()
             try:
+                attempts += 1
                 # CRITICAL: tradingview_ta defaults timeout=None, which means
                 # requests.post hangs FOREVER on stalled upstream. socket.setdefaulttimeout
                 # does NOT apply to requests/urllib3. Pass timeout explicitly.
@@ -418,11 +630,13 @@ def resilient_get_multiple_analysis(screener, interval, symbols):
                     screener=screener,
                     interval=interval,
                     symbols=symbols,
-                    timeout=_socket_timeout_s(),
+                    additional_indicators=list(TA_EXTRA_COLUMNS),
+                    timeout=ta_call_time_left(call, _socket_timeout_s()),
                 )
             finally:
                 _ta_throttle_release()
             _cache_set(cache_key, result)
+            _clear_ta_failure()
             return result
         except Exception as e:  # noqa: BLE001
             if not _is_transient_screener_error(e):
@@ -442,18 +656,172 @@ def resilient_get_multiple_analysis(screener, interval, symbols):
     # Last-resort: stale-while-error fallback (up to TRADINGVIEW_MCP_STALE_TTL)
     stale = _cache_get_stale(cache_key)
     if stale is not None:
-        age, payload = stale
-        try:
-            print(
-                f"[tradingview_mcp] returning stale TA cache (age {age:.0f}s, symbols={symbols}) "
-                f"after {len(delays)} failed attempts",
-                file=_sys.stderr,
-            )
-        except Exception:
-            pass
-        return payload
+        return _stale_ta_result(stale, symbols, call, f"after {attempts} failed attempts")
     assert last_exc is not None
-    raise RuntimeError(_format_transient_error(last_exc, len(delays), total_wait)) from last_exc
+    raise RuntimeError(
+        _format_transient_error(last_exc, attempts, total_wait, why_short)
+    ) from last_exc
+
+
+def _stale_ta_result(stale: Tuple[float, Any], symbols, call: Optional[dict], how: str) -> Any:
+    """Return a stale TA payload, logging it and telling the open ta_call()."""
+    age, payload = stale
+    if call is not None:
+        call["stale_age_s"] = age
+    try:
+        print(
+            f"[tradingview_mcp] returning stale TA cache (age {age:.0f}s, symbols={symbols}) {how}",
+            file=_sys.stderr,
+        )
+    except Exception:
+        pass
+    return payload
+
+
+# Column suffix per timeframe, exactly as tradingview_ta builds it: the daily
+# interval is the bare column ("close", not "close|1D", which the scanner
+# answers with null).
+_TA_INTERVAL_SUFFIX = {
+    '5m': '|5',
+    '15m': '|15',
+    '1h': '|60',
+    '4h': '|240',
+    '1D': '',
+    '1W': '|1W',
+    '1M': '|1M',
+}
+
+
+def resilient_scan_columns(
+    screener: str,
+    interval: str,
+    symbols: List[str],
+    columns: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch ``columns`` for every symbol in ONE scanner request.
+
+    The lean path for whole-exchange scans. ``get_multiple_analysis`` asks for
+    ~90 indicator columns and the scanners called it in 200-symbol batches, so
+    a NASDAQ scan (~5,000 tickers) took 25 requests. That burst ran past the
+    30s scan budget and tripped TradingView's empty-body throttling. One
+    request for just the needed columns takes about a second.
+
+    Shares the resilience layer: 60s fresh cache, retry with backoff, failure
+    cooldown and the 6h stale-while-error fallback.
+
+    Args:
+        screener: Scanner market (``"america"``, ``"crypto"``, ``"turkey"``, …).
+        interval: Our timeframe string (``5m`` … ``1M``).
+        symbols:  Fully-qualified tickers (``"NASDAQ:AAPL"``).
+        columns:  Bare column names (``"close"``, ``"SMA20"``, …).
+
+    Returns:
+        ``{ticker: {column: value}}`` keyed by the bare column names, like
+        ``Analysis.indicators``. Values the scanner has no data for are
+        ``None``, and tickers it doesn't know are absent.
+    """
+    from tradingview_screener import Query
+
+    if not symbols:
+        return {}
+    suffix = _TA_INTERVAL_SUFFIX.get(interval, '')
+    cache_key = ('scan_columns_v1', screener, suffix, tuple(columns), tuple(symbols))
+    payload = _cache_get(cache_key)
+    if payload is None:
+        q = (
+            Query()
+            .select(*(c + suffix for c in columns))
+            .set_tickers(*symbols)
+            .set_markets(screener)
+            .limit(len(symbols))
+        )
+        # Callers rank on their own metric; a server-side sort is wasted work.
+        q.query.pop('sort', None)
+        payload = _scan_with_retry(q, cache_key=cache_key, raw=True, throttle=True)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in payload.get('data') or []:
+        if not isinstance(row, dict):
+            continue
+        sym = row.get('s')
+        values = row.get('d')
+        if not sym or not isinstance(values, list) or len(values) != len(columns):
+            continue
+        out[sym] = dict(zip(columns, values))
+    return out
+
+
+def resilient_multi_timeframe_analysis(
+    screener: str,
+    symbol: str,
+    timeframes: List[str],
+) -> Dict[str, Any]:
+    """tradingview_ta ``Analysis`` for ONE symbol on several timeframes, from
+    ONE scanner request.
+
+    multi_timeframe_analysis used to call ``get_multiple_analysis`` once per
+    timeframe and then fetch ATR once per timeframe: ten requests within a few
+    seconds for a single tool call. That is what trips TradingView's
+    empty-body throttling, and on the hosted server about a third of real calls
+    ended with every timeframe failing after ~25s of retries. The scanner
+    accepts the per-interval columns of all timeframes in one request (about
+    470 columns, ~0.2s), ATR included, so this asks once and builds each
+    timeframe's ``Analysis`` locally with tradingview_ta's own ``calculate``.
+
+    Shares the resilience layer: 60s fresh cache, retry with backoff, failure
+    cooldown, the 6h stale-while-error fallback and the TA throttle slot.
+
+    Args:
+        screener:   Scanner market (``"crypto"``, ``"america"``, …).
+        symbol:     Fully-qualified ticker (``"KUCOIN:BTCUSDT"``).
+        timeframes: Our timeframe strings (``1W``, ``1D``, ``4h``, ``1h``, ``15m``…).
+
+    Returns:
+        ``{timeframe: Analysis or None}``: None where the scanner has no data
+        for that timeframe (or for the symbol at all). Raises the resilience
+        layer's terminal error when the request itself keeps failing.
+    """
+    from tradingview_screener import Query
+    from tradingview_ta.main import TradingView, calculate  # type: ignore
+
+    # tradingview_ta's columns in its own order (calculate() reads them by
+    # position), then ours appended at the end as its docs allow. ATR rides in
+    # the same request instead of a follow-up request per timeframe.
+    keys = TradingView.indicators.copy() + list(TA_EXTRA_COLUMNS) + ['ATR']
+    columns = [k + _TA_INTERVAL_SUFFIX.get(tf, '') for tf in timeframes for k in keys]
+    cache_key = ('ta_mtf_v1', screener, symbol, tuple(timeframes))
+    payload = _cache_get(cache_key)
+    if payload is None:
+        q = (
+            Query()
+            .select(*columns)
+            .set_tickers(symbol)
+            .set_markets(screener)
+            .limit(1)
+        )
+        q.query.pop('sort', None)
+        payload = _scan_with_retry(q, cache_key=cache_key, raw=True, throttle=True)
+
+    rows = [r for r in (payload.get('data') or []) if isinstance(r, dict)]
+    row = next((r for r in rows if str(r.get('s', '')).upper() == symbol.upper()), rows[0] if rows else None)
+    values = row.get('d') if row else None
+    exchange, _, ticker = str(row.get('s', symbol) if row else symbol).partition(':')
+
+    out: Dict[str, Any] = {}
+    for i, tf in enumerate(timeframes):
+        if not isinstance(values, list) or len(values) != len(columns):
+            out[tf] = None
+            continue
+        indicators = dict(zip(keys, values[i * len(keys):(i + 1) * len(keys)]))
+        out[tf] = calculate(
+            indicators=indicators,
+            indicators_key=keys,
+            screener=screener,
+            symbol=ticker,
+            exchange=exchange,
+            interval=tf,
+        )
+    return out
 
 
 def _tf_to_tv_resolution(tf: Optional[str]) -> Optional[str]:
@@ -570,213 +938,3 @@ def fetch_atr_for_ticker(
         return None
     return fetch_atr_for_tickers([ticker], screener_market, timeframe, timeout).get(ticker)
 
-
-def fetch_screener_indicators(
-    exchange: str,
-    symbols: Optional[List[str]] = None,
-    limit: Optional[int] = None,
-    timeframe: Optional[str] = None,
-    cookies=None,
-) -> List[Dict[str, Any]]:
-    """
-    Fetch indicator columns via TradingView-Screener.
-    Two modes:
-    - Tickers mode: pass symbols => .set_tickers(*symbols)
-    - Exchange scan mode: pass symbols=None/[] => filter by exchange using .where(Column('exchange') == <EXCHANGE>)
-
-    Args:
-      exchange: e.g. 'kucoin' or 'binance'. Case-insensitive.
-      symbols: list of 'EXCHANGE:SYMBOL' tickers. If empty/None, scans by exchange.
-      limit: optional limit of rows to return.
-      timeframe: optional timeframe like '5m', '15m', '1h', '4h', '1D', '1W', '1M'.
-      cookies: optional requests cookies for live data.
-
-    Returns: List[{ 'symbol': 'EXCHANGE:PAIR', 'indicators': {...} }]
-    """
-    try:
-        from tradingview_screener import Query
-        from tradingview_screener.column import Column
-    except Exception as e:
-        raise ImportError("tradingview-screener is not installed. Please add it to requirements.txt and install.") from e
-
-    market = get_market_type(exchange) if exchange else 'crypto'
-    base_cols = ['open', 'close', 'SMA20', 'BB.upper', 'BB.lower', 'EMA50', 'RSI', 'volume']
-
-    suffix = _tf_to_tv_resolution(timeframe)
-    cols = [f"{c}|{suffix}" if suffix else c for c in base_cols]
-
-    q = Query().set_markets(market).select(*cols)
-
-    exchange_code = (exchange or '').upper()
-
-    if symbols:
-        # Tickers mode
-        q = q.set_tickers(*symbols)
-    else:
-        # Exchange scan mode (no symbol list). Filter by exchange and type via markets
-        if exchange_code:
-            q = q.where(Column('exchange') == exchange_code)
-
-    if limit:
-        q = q.limit(int(limit))
-
-    # Cache key: scope to indicators_v1 to avoid collisions with multi_changes.
-    _cache_key = (
-        'indicators_v1',
-        exchange_code,
-        tuple(sorted(symbols)) if symbols else None,
-        timeframe,
-        int(limit) if limit else None,
-    )
-    _cached = _cache_get(_cache_key)
-    if _cached is not None:
-        total, df = _cached
-    else:
-        total, df = _scan_with_retry(q, cookies=cookies, cache_key=_cache_key)
-        _cache_set(_cache_key, (total, df))
-
-    rows: List[Dict[str, Any]] = []
-    if df is None or df.empty:
-        return rows
-
-    # If we used timeframe suffix (e.g., 'close|240'), normalize column names back to base (e.g., 'close')
-    df.rename(columns=lambda c: c.split('|')[0] if isinstance(c, str) else c, inplace=True)
-
-    for _, row in df.iterrows():
-        symbol = row.get('ticker')
-        indicators = {
-            'open': row.get('open'),
-            'close': row.get('close'),
-            'SMA20': row.get('SMA20'),
-            'BB.upper': row.get('BB.upper'),
-            'BB.lower': row.get('BB.lower'),
-            'EMA50': row.get('EMA50'),
-            'RSI': row.get('RSI'),
-            'volume': row.get('volume'),
-        }
-        rows.append({'symbol': symbol, 'indicators': indicators})
-
-    return rows
-
-
-def fetch_screener_multi_changes(
-    exchange: str,
-    symbols: Optional[List[str]] = None,
-    timeframes: Optional[List[str]] = None,
-    base_timeframe: str = '4h',
-    limit: Optional[int] = None,
-    cookies=None,
-) -> List[Dict[str, Any]]:
-    """
-    Fetch multi-timeframe open/close to compute percentage changes per timeframe,
-    and also include base timeframe indicators needed for BB metrics.
-
-    Returns rows like:
-      {
-        'symbol': 'KUCOIN:ABCUSDT',
-        'changes': { '15m': 1.23, '1h': 2.34, '4h': -0.56, '1D': 3.21 },
-        'base_indicators': { 'open': ..., 'close': ..., 'SMA20': ..., 'BB.upper': ..., 'BB.lower': ..., 'volume': ... }
-      }
-    """
-    try:
-        from tradingview_screener import Query
-        from tradingview_screener.column import Column
-    except Exception as e:
-        raise ImportError("tradingview-screener is not installed. Please add it to requirements.txt and install.") from e
-
-    # Default timeframe set
-    if not timeframes:
-        timeframes = ['15m', '1h', '4h', '1D']
-
-    def _tf_to_tv_resolution(tf: Optional[str]) -> Optional[str]:
-        mapping = {
-            '5m': '5',
-            '15m': '15',
-            '1h': '60',
-            '4h': '240',
-            '1D': '1D',
-            '1W': '1W',
-            '1M': '1M',
-        }
-        return mapping.get(tf or '')
-
-    # Build suffix map and filter invalid tfs
-    suffix_map: Dict[str, str] = {}
-    for tf in timeframes:
-        s = _tf_to_tv_resolution(tf)
-        if s:
-            suffix_map[tf] = s
-    if not suffix_map:
-        # fallback to base only
-        bs = _tf_to_tv_resolution(base_timeframe) or '240'
-        suffix_map = {base_timeframe: bs}
-
-    base_suffix = _tf_to_tv_resolution(base_timeframe) or next(iter(suffix_map.values()))
-
-    # Build columns: for each tf -> open|s, close|s; for base -> add BB cols and volume
-    cols: List[str] = []
-    seen: set[str] = set()
-    for tf, s in suffix_map.items():
-        for c in (f'open|{s}', f'close|{s}'):
-            if c not in seen:
-                cols.append(c); seen.add(c)
-    for c in (f'SMA20|{base_suffix}', f'BB.upper|{base_suffix}', f'BB.lower|{base_suffix}', f'volume|{base_suffix}'):
-        if c not in seen:
-            cols.append(c); seen.add(c)
-
-    market = get_market_type(exchange) if exchange else 'crypto'
-    q = Query().set_markets(market).select(*cols)
-
-    exchange_code = (exchange or '').upper()
-    if symbols:
-        q = q.set_tickers(*symbols)
-    else:
-        if exchange_code:
-            q = q.where(Column('exchange') == exchange_code)
-    if limit:
-        q = q.limit(int(limit))
-
-    # Cache key: scope to multichanges_v1 to avoid collisions with indicators.
-    _cache_key = (
-        'multichanges_v1',
-        exchange_code,
-        tuple(sorted(symbols)) if symbols else None,
-        tuple(sorted(suffix_map.keys())),
-        base_timeframe,
-        int(limit) if limit else None,
-    )
-    _cached = _cache_get(_cache_key)
-    if _cached is not None:
-        total, df = _cached
-    else:
-        total, df = _scan_with_retry(q, cookies=cookies, cache_key=_cache_key)
-        _cache_set(_cache_key, (total, df))
-
-    rows: List[Dict[str, Any]] = []
-    if df is None or df.empty:
-        return rows
-
-    # Iterate rows and compute changes per tf; prepare base indicators
-    for _, row in df.iterrows():
-        symbol = row.get('ticker')
-        changes: Dict[str, Optional[float]] = {}
-        for tf, s in suffix_map.items():
-            op = row.get(f'open|{s}')
-            cl = row.get(f'close|{s}')
-            try:
-                changes[tf] = ((cl - op) / op) * 100 if op not in (None, 0) and cl is not None else None
-            except Exception:
-                changes[tf] = None
-
-        base_indicators = {
-            'open': row.get(f'open|{base_suffix}'),
-            'close': row.get(f'close|{base_suffix}'),
-            'SMA20': row.get(f'SMA20|{base_suffix}'),
-            'BB.upper': row.get(f'BB.upper|{base_suffix}'),
-            'BB.lower': row.get(f'BB.lower|{base_suffix}'),
-            'volume': row.get(f'volume|{base_suffix}'),
-        }
-
-        rows.append({'symbol': symbol, 'changes': changes, 'base_indicators': base_indicators})
-
-    return rows

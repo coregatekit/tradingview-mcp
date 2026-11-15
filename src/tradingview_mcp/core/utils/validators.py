@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
-from typing import Set
+import re
+from typing import Optional, Set, Tuple
 
 ALLOWED_TIMEFRAMES: Set[str] = {"5m", "15m", "1h", "4h", "1D", "1W", "1M"}
 _TIMEFRAME_ALIASES = {
@@ -11,6 +12,19 @@ _TIMEFRAME_ALIASES = {
     "1d": "1D",
     "1w": "1W",
     "1m": "1M",
+    # TradingView's own interval codes: minutes as a bare number, D/W for day
+    # and week. Programmatic integrations send these ("60", "240"). Before
+    # 0.9.0 an unknown value silently fell back to the tool default, so a
+    # "60" request quietly got 15m data; since 0.9.0 it raised
+    # INVALID_TIMEFRAME. Only intervals the server supports are mapped, so
+    # "30", "120" etc. still fail loudly.
+    "5": "5m",
+    "15": "15m",
+    "60": "1h",
+    "240": "4h",
+    "1440": "1D",
+    "d": "1D",
+    "w": "1W",
 }
 
 # Exchanges that represent stock markets (not crypto)
@@ -23,6 +37,25 @@ STOCK_EXCHANGES: Set[str] = {
     "sse", "szse", "chn",
     "twse", "tpex",
     "tadawul", "tasi",                  # Saudi Stock Exchange (Tadawul) — All Share Index (TASI)
+    # European + Canadian stock markets. The first name on each line is the
+    # venue's canonical name (its coinlist file); the rest are aliases that
+    # COINLIST_ALIASES points at the same file.
+    "epa", "paris", "enx",              # Euronext Paris
+    "ams", "aex",                       # Euronext Amsterdam
+    "bru", "enb",                       # Euronext Brussels
+    "lis", "elp",                       # Euronext Lisbon
+    "mil", "milan", "bit",              # Borsa Italiana
+    "lse", "lon",                       # London Stock Exchange
+    "six", "swx",                       # SIX Swiss Exchange
+    "bme",                              # Bolsa de Madrid
+    "tsx",                              # Toronto Stock Exchange
+    "tsxv", "xsx", "ventures",          # TSX Venture Exchange
+    "xetra", "xetr",                    # Xetra
+    "fwb", "fra",                       # Börse Frankfurt
+    # India + Indonesia
+    "nse",                              # National Stock Exchange of India
+    "bse",                              # BSE (Bombay Stock Exchange)
+    "idx",                              # Indonesia Stock Exchange
 }
 
 EXCHANGE_SCREENER = {
@@ -67,6 +100,22 @@ EXCHANGE_SCREENER = {
     # Saudi Stock Market (Tadawul) — TradingView scanner uses /ksa/
     "tadawul": "ksa",
     "tasi": "ksa",          # alias: Tadawul All Share Index
+    # ── European + Canadian stock markets (TradingView country slugs) ──
+    "epa": "france", "paris": "france", "enx": "france",     # Euronext Paris
+    "ams": "netherlands", "aex": "netherlands",              # Euronext Amsterdam
+    "bru": "belgium", "enb": "belgium",                      # Euronext Brussels
+    "lis": "portugal", "elp": "portugal",                    # Euronext Lisbon
+    "mil": "italy", "milan": "italy", "bit": "italy",         # Borsa Italiana
+    "lse": "uk", "lon": "uk",                                 # London
+    "six": "switzerland", "swx": "switzerland",               # SIX Swiss Exchange
+    "bme": "spain",                                           # Bolsa de Madrid
+    "tsx": "canada",                                          # Toronto
+    "tsxv": "canada", "xsx": "canada", "ventures": "canada",  # TSX Venture
+    "xetra": "germany", "xetr": "germany",                    # Xetra
+    "fwb": "germany", "fra": "germany",                       # Börse Frankfurt
+    # ── India + Indonesia ──
+    "nse": "india", "bse": "india",
+    "idx": "indonesia",
 }
 
 # Venues TradingView serves for single-symbol TA (tradingview-ta) but NOT via the
@@ -111,6 +160,39 @@ _EXCHANGE_TV_PREFIX: dict = {
     "tpex": "TPEX",
     "tadawul": "TADAWUL",
     "tasi": "TADAWUL",
+    # ── European + Canadian TV symbol prefixes ──
+    "epa": "EURONEXT", "paris": "EURONEXT", "enx": "EURONEXT",
+    "ams": "EURONEXT", "aex": "EURONEXT",
+    "bru": "EURONEXT", "enb": "EURONEXT",
+    "lis": "EURONEXT", "elp": "EURONEXT",
+    "mil": "MIL", "milan": "MIL", "bit": "MIL",
+    "lse": "LSE", "lon": "LSE",
+    "six": "SIX", "swx": "SIX",
+    "bme": "BME",
+    "tsx": "TSX",
+    # Venture listings live under TSXV: "TSX:AMY" returns 0 rows, "TSXV:AMY" data.
+    "tsxv": "TSXV", "xsx": "TSXV", "ventures": "TSXV",
+    # Xetra and Frankfurt are different venues with different prices.
+    "xetra": "XETR", "xetr": "XETR",
+    "fwb": "FWB", "fra": "FWB",
+    # ── India + Indonesia ──
+    "nse": "NSE", "bse": "BSE",
+    "idx": "IDX",
+}
+
+# Exchange aliases that read their venue's coinlist instead of shipping a
+# duplicate file: alias -> canonical name (= the coinlist file's stem).
+COINLIST_ALIASES: dict = {
+    "paris": "epa", "enx": "epa",
+    "aex": "ams",
+    "enb": "bru",
+    "elp": "lis",
+    "milan": "mil", "bit": "mil",
+    "lon": "lse",
+    "swx": "six",
+    "xsx": "tsxv", "ventures": "tsxv",
+    "xetr": "xetra",
+    "fra": "fwb",
 }
 
 _YAHOO_SYMBOL_ALIASES: dict = {
@@ -143,6 +225,13 @@ _TRADINGVIEW_SYMBOL_ALIASES: dict = {
     "SI1!": "TVC:SILVER", "SIL1!": "TVC:SILVER", "SIUSD": "TVC:SILVER",
     "PL1!": "TVC:PLATINUM", "XPTUSD": "TVC:PLATINUM",
     "PA1!": "TVC:PALLADIUM", "XPDUSD": "TVC:PALLADIUM",
+    # Benchmark indices by their common and Yahoo names, so "analyze NIFTY"
+    # works whatever exchange the caller guessed (the screener follows the
+    # resolved prefix).
+    "NIFTY": "NSE:NIFTY", "NIFTY50": "NSE:NIFTY", "^NSEI": "NSE:NIFTY",
+    "BANKNIFTY": "NSE:BANKNIFTY", "^NSEBANK": "NSE:BANKNIFTY",
+    "SENSEX": "BSE:SENSEX", "^BSESN": "BSE:SENSEX",
+    "JKSE": "IDX:COMPOSITE", "^JKSE": "IDX:COMPOSITE", "IHSG": "IDX:COMPOSITE",
 }
 
 # "Soft" commodity aliases: bare tickers that ALSO exist as real equities/indices
@@ -167,10 +256,49 @@ def get_tv_exchange_prefix(exchange: str) -> str:
     return _EXCHANGE_TV_PREFIX.get(exchange.strip().lower(), exchange.upper())
 
 
+# Yahoo has no spot precious metals. XAUUSD=X (the EURUSD=X spelling),
+# XAGUSD=X, XPTUSD=X, XPDUSD=X, XAU=X and plain XAUUSD all 404, and XAU-USD
+# is an unrelated token quoted at 0. Yahoo's gold, silver, platinum and
+# palladium are the front-month futures, so those stand in, and the caller is
+# told it got futures. The pattern takes the forms users type, after any
+# EXCHANGE: prefix (OANDA:XAUUSD): XAUUSD, XAU-USD, XAU/USD, XAUUSDT, with or
+# without =X, and XAU=X. A bare XAU or XAG is left alone.
+_YAHOO_METAL_FUTURES: dict = {
+    "XAU": ("GC=F", "gold"),
+    "XAG": ("SI=F", "silver"),
+    "XPT": ("PL=F", "platinum"),
+    "XPD": ("PA=F", "palladium"),
+}
+_YAHOO_METAL_RE = re.compile(r"(XAU|XAG|XPT|XPD)(?:[-/]?USDT?(?:=X)?|=X)")
+
+
+def yahoo_metal_futures(symbol: str) -> Optional[Tuple[str, str]]:
+    """``(futures ticker, note)`` when *symbol* is a spot precious metal that
+    Yahoo Finance only has as futures (``XAUUSD=X`` → ``GC=F``), else None.
+
+    The note is for the tool result: the price is the front-month future's,
+    not spot's.
+    """
+    raw = (symbol or "").strip().upper()
+    bare = raw.split(":", 1)[1] if ":" in raw else raw
+    metal = _YAHOO_METAL_RE.fullmatch(bare)
+    if not metal:
+        return None
+    ticker, name = _YAHOO_METAL_FUTURES[metal.group(1)]
+    return ticker, (
+        f"Yahoo Finance has no spot {name} price for {bare}, so this is "
+        f"{name} futures {ticker} (front month), not spot. Futures trade "
+        "close to, but not exactly at, the spot price."
+    )
+
+
 def normalize_yahoo_symbol(symbol: str) -> str:
     """Return a provider-specific Yahoo Finance symbol for common user aliases."""
     raw = (symbol or "").strip().upper()
-    return _YAHOO_SYMBOL_ALIASES.get(raw, raw)
+    if raw in _YAHOO_SYMBOL_ALIASES:
+        return _YAHOO_SYMBOL_ALIASES[raw]
+    metal = yahoo_metal_futures(raw)
+    return metal[0] if metal else raw
 
 
 def normalize_tradingview_symbol(symbol: str, exchange: str) -> str:
@@ -212,6 +340,45 @@ def sanitize_exchange(ex: str, default: str = "kucoin") -> str:
     return default
 
 
+# Strict variants used at the MCP tool boundary. The sanitize_* pair silently
+# substitutes the default on bad input — an LLM asking for KRAKEN got KUCOIN
+# data with no indication anything was wrong. These raise instead, and the
+# tool wrapper converts the exception to a typed error envelope the caller
+# can self-correct from. Empty/None still means "use the default": callers
+# that omitted the parameter never asked for a specific market.
+
+def validate_timeframe(tf: str, default: str = "5m") -> str:
+    from tradingview_mcp.core.errors import ErrorCode, ScreenerServiceError
+
+    if not tf:
+        return default
+    normalized = tf.strip().lower()
+    if normalized in _TIMEFRAME_ALIASES:
+        return _TIMEFRAME_ALIASES[normalized]
+    raise ScreenerServiceError(
+        ErrorCode.INVALID_TIMEFRAME,
+        f"Invalid timeframe {tf!r}.",
+        valid_timeframes=sorted(ALLOWED_TIMEFRAMES),
+        retryable=False,
+    )
+
+
+def validate_exchange(ex: str, default: str = "kucoin") -> str:
+    from tradingview_mcp.core.errors import ErrorCode, ScreenerServiceError
+
+    if not ex:
+        return default
+    exs = ex.strip().lower()
+    if exs in EXCHANGE_SCREENER or exs in _TA_ONLY_SCREENERS:
+        return exs
+    raise ScreenerServiceError(
+        ErrorCode.INVALID_EXCHANGE,
+        f"Invalid exchange {ex!r}.",
+        valid_exchanges=sorted({*EXCHANGE_SCREENER, *_TA_ONLY_SCREENERS}),
+        retryable=False,
+    )
+
+
 def is_stock_exchange(exchange: str) -> bool:
     """Return True if the exchange is a stock market (not crypto)."""
     return exchange.strip().lower() in STOCK_EXCHANGES
@@ -234,6 +401,16 @@ def resolve_screener_for_symbol(full_symbol: str, exchange: str) -> str:
     """
     prefix = (full_symbol.split(":", 1)[0] if ":" in full_symbol
               else (exchange or "")).strip().lower()
+    if prefix == "euronext":
+        # One prefix, four markets (Paris, Amsterdam, Brussels, Lisbon): the
+        # prefix alone can't pick the screener, so follow the venue the caller
+        # named, defaulting to Paris. Without this EURONEXT:* fell through to
+        # "crypto", found nothing, and venue fallback answered with a
+        # different company sharing the ticker (EPA MC -> NYSE:MC).
+        venue = (exchange or "").strip().lower()
+        if _EXCHANGE_TV_PREFIX.get(venue) == "EURONEXT":
+            return EXCHANGE_SCREENER[venue]
+        return "france"
     return (EXCHANGE_SCREENER.get(prefix)
             or _TA_ONLY_SCREENERS.get(prefix)
             or "crypto")

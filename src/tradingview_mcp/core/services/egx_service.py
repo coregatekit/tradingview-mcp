@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 from tradingview_mcp.core.services.coinlist import load_symbols
 from tradingview_mcp.core.services.indicators import (
+    AVERAGE_VOLUME,
+    RELATIVE_VOLUME,
     compute_metrics,
     extract_extended_indicators,
     compute_stock_score,
@@ -67,12 +69,21 @@ def get_egx_market_overview(timeframe: str = "1D", limit: int = 10) -> dict:
     screener = EXCHANGE_SCREENER.get("egx", "egypt")
     all_stocks: List[dict] = []
     batch_size = 200
+    batches_failed = 0
+    symbols_skipped = 0
+    first_error: str | None = None
 
     for i in range(0, len(symbols), batch_size):
         batch = symbols[i : i + batch_size]
         try:
             analysis = get_multiple_analysis(screener=screener, interval=timeframe, symbols=batch)
-        except Exception:
+        except Exception as exc:
+            # Count instead of swallowing outright — a systemic failure
+            # (auth change, schema change) used to surface only as
+            # "No data returned for EGX stocks" with zero diagnostic.
+            batches_failed += 1
+            if first_error is None:
+                first_error = repr(exc)
             continue
 
         for sym, data in analysis.items():
@@ -96,10 +107,15 @@ def get_egx_market_overview(timeframe: str = "1D", limit: int = 10) -> dict:
                     }
                 )
             except Exception:
+                symbols_skipped += 1
                 continue
 
     if not all_stocks:
-        return {"error": "No data returned for EGX stocks", "timeframe": timeframe}
+        out = {"error": "No data returned for EGX stocks", "timeframe": timeframe}
+        if batches_failed:
+            out["batches_failed"] = batches_failed
+            out["first_error"] = first_error
+        return out
 
     by_change = sorted(all_stocks, key=lambda x: x["changePercent"], reverse=True)
     by_volume = sorted(all_stocks, key=lambda x: x["volume"] or 0, reverse=True)
@@ -108,6 +124,8 @@ def get_egx_market_overview(timeframe: str = "1D", limit: int = 10) -> dict:
         "exchange": "EGX",
         "timeframe": timeframe,
         "total_analyzed": len(all_stocks),
+        "batches_failed": batches_failed,
+        "symbols_skipped": symbols_skipped,
         "top_gainers": by_change[:limit],
         "top_losers": by_change[-limit:][::-1],
         "most_active": by_volume[:limit],
@@ -381,8 +399,12 @@ def run_egx_sector_scanner(
                 rsis.append(rsi)
 
             vol = ind.get("volume", 0) or 0
-            vol_sma = ind.get("volume.SMA20", 0) or 0
-            net_volume_flow += vol - vol_sma
+            rel_vol = ind.get(RELATIVE_VOLUME)
+            if vol and rel_vol:
+                # Volume above (+) or below (-) the mean of the previous 10 bars.
+                # It used to subtract a "volume.SMA20" that was never fetched,
+                # so every sector's flow was the raw volume: always positive.
+                net_volume_flow += vol - vol / rel_vol
 
             if sym in stock_scores:
                 sc = stock_scores[sym]
@@ -545,7 +567,7 @@ def run_egx_sector_scanner(
             if result["score"] >= 70:
                 setup = compute_trade_setup(ind)
                 if setup:
-                    quality = compute_trade_quality(ind, result["score"], setup)
+                    quality = compute_trade_quality(ind, setup)
                     entry["trade_setup"] = {
                         "setup_types": setup["setup_types"],
                         "entry_points": setup["entry_points"],
@@ -553,6 +575,8 @@ def run_egx_sector_scanner(
                         "stop_distance_pct": setup["stop_distance_pct"],
                         "targets": setup["targets"],
                         "risk_reward": setup["risk_reward"],
+                        "scenarios": setup.get("scenarios", {}),
+                        "primary_scenario": setup.get("primary_scenario"),
                         "supports": setup["supports"],
                         "resistances": setup["resistances"],
                     }
@@ -807,9 +831,9 @@ def screen_egx_stocks(
             if not metrics:
                 continue
 
-            vol_sma = ind.get("volume.SMA20")
+            avg_volume = ind.get(AVERAGE_VOLUME)
             liquidity_status = "Pass"
-            if vol_sma and vol_sma < 10000:
+            if avg_volume and avg_volume < 10000:
                 liquidity_status = "Fail — Very Low"
                 if min_score >= 55:
                     continue
@@ -831,7 +855,7 @@ def screen_egx_stocks(
             if result["score"] >= 70:
                 setup = compute_trade_setup(ind)
                 if setup:
-                    quality = compute_trade_quality(ind, result["score"], setup)
+                    quality = compute_trade_quality(ind, setup)
                     stock_entry["trade_setup"] = {
                         "setup_types": setup["setup_types"],
                         "entry_points": setup["entry_points"],
@@ -839,6 +863,8 @@ def screen_egx_stocks(
                         "stop_distance_pct": setup["stop_distance_pct"],
                         "targets": setup["targets"],
                         "risk_reward": setup["risk_reward"],
+                        "scenarios": setup.get("scenarios", {}),
+                        "primary_scenario": setup.get("primary_scenario"),
                         "supports": setup["supports"],
                         "resistances": setup["resistances"],
                     }
@@ -929,7 +955,7 @@ def generate_egx_trade_plan(symbol: str, timeframe: str = "1D") -> dict:
         return {"error": f"Could not compute stock score for {full_symbol}"}
 
     setup = compute_trade_setup(ind)
-    quality = compute_trade_quality(ind, score_result["score"], setup) if setup else None
+    quality = compute_trade_quality(ind, setup) if setup else None
     extended = extract_extended_indicators(ind)
 
     output: dict = {
@@ -963,6 +989,8 @@ def generate_egx_trade_plan(symbol: str, timeframe: str = "1D") -> dict:
             "stop_distance_pct": setup["stop_distance_pct"],
             "targets": setup["targets"],
             "risk_reward": setup["risk_reward"],
+            "scenarios": setup.get("scenarios", {}),
+            "primary_scenario": setup.get("primary_scenario"),
             "supports": setup["supports"],
             "resistances": setup["resistances"],
         }
@@ -1094,6 +1122,14 @@ def analyze_egx_fibonacci(
                 "hint": "Period high/low data not available for this symbol",
             }
 
+    if swing_low <= 0:
+        # Possible via the R3/S3 pivot fallback above; dividing by it would
+        # raise an uncaught ZeroDivisionError out of the tool.
+        return {
+            "error": "Invalid swing low (<= 0) — cannot compute Fibonacci range",
+            "swing_high": swing_high,
+            "swing_low": swing_low,
+        }
     swing_range_pct = ((swing_high - swing_low) / swing_low) * 100
     if swing_range_pct < 2:
         return {
@@ -1111,8 +1147,8 @@ def analyze_egx_fibonacci(
     rsi_val = ind.get("RSI")
     atr_val = ind.get("ATR")
     vol = ind.get("volume")
-    vol_sma = ind.get("volume.SMA20")
-    vol_ratio = round(vol / vol_sma, 2) if vol and vol_sma and vol_sma > 0 else None
+    rel_vol = ind.get(RELATIVE_VOLUME)
+    vol_ratio = round(rel_vol, 2) if vol and rel_vol is not None else None
     change_pct = (
         round(((close - ind.get("open", close)) / ind.get("open", close)) * 100, 2)
         if ind.get("open")
